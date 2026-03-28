@@ -85,7 +85,8 @@ module picorv32 #(
 	parameter [31:0] LATCHED_IRQ = 32'h ffff_ffff,
 	parameter [31:0] PROGADDR_RESET = 32'h 0000_0000,
 	parameter [31:0] PROGADDR_IRQ = 32'h 0000_0010,
-	parameter [31:0] STACKADDR = 32'h ffff_ffff
+	parameter [31:0] STACKADDR = 32'h ffff_ffff,
+	parameter [ 0:0] HALT_DEBUG = 1
 ) (
 	input clk, resetn,
 	output reg trap,
@@ -106,6 +107,22 @@ module picorv32 #(
 	output reg [31:0] mem_la_wdata,
 	output reg [ 3:0] mem_la_wstrb,
 
+	//debug interface
+	input halt_debug_mode,
+	input halt,
+	output reg halted,
+	input step,
+	output reg steped,
+	input	resume,
+	output [31:0] output_pc,
+	input	[31:0] write_pc,
+	input	wr_pc,
+	input 	[5:0] reg_addr,
+	input	reg_wr,
+	input	[31:0] reg_wr_data,
+	output reg [31:0] reg_rdata,
+	input	reg_valid,
+	output reg reg_xfer_ready,
 	// Pico Co-Processor Interface (PCPI)
 	output reg        pcpi_valid,
 	output reg [31:0] pcpi_insn,
@@ -564,9 +581,9 @@ module picorv32 #(
 
 	always @(posedge clk) begin
 		if (!resetn || trap) begin
-			if (!resetn)
+			if (!resetn || (HALT_DEBUG&&halted))
 				mem_state <= 0;
-			if (!resetn || mem_ready)
+			if (!resetn || mem_ready || (HALT_DEBUG&&halted))
 				mem_valid <= 0;
 			mem_la_secondword <= 0;
 			prefetched_high_word <= 0;
@@ -650,6 +667,7 @@ module picorv32 #(
 	reg instr_add, instr_sub, instr_sll, instr_slt, instr_sltu, instr_xor, instr_srl, instr_sra, instr_or, instr_and;
 	reg instr_rdcycle, instr_rdcycleh, instr_rdinstr, instr_rdinstrh, instr_ecall_ebreak, instr_fence;
 	reg instr_getq, instr_setq, instr_retirq, instr_maskirq, instr_waitirq, instr_timer;
+	reg instr_ebreak;
 	wire instr_trap;
 
 	reg [regindex_bits-1:0] decoded_rd, decoded_rs1;
@@ -1033,7 +1051,11 @@ module picorv32 #(
 				endcase
 			end
 		end
-
+		if(HALT_DEBUG)begin
+			if(halt_debug_mode && halted) begin
+				decoded_rs1 <= reg_addr;
+			end
+		end
 		if (decoder_trigger && !decoder_pseudo_trigger) begin
 			pcpi_insn <= WITH_PCPI ? mem_rdata_q : 'bx;
 
@@ -1085,6 +1107,7 @@ module picorv32 #(
 
 			instr_ecall_ebreak <= ((mem_rdata_q[6:0] == 7'b1110011 && !mem_rdata_q[31:21] && !mem_rdata_q[19:7]) ||
 					(COMPRESSED_ISA && mem_rdata_q[15:0] == 16'h9002));
+			instr_ebreak <= ((COMPRESSED_ISA && mem_rdata_q[15:0] == 16'h9002) || (mem_rdata_q[31:0] == 32'h00100073) );
 			instr_fence <= (mem_rdata_q[6:0] == 7'b0001111 && !mem_rdata_q[14:12]);
 
 			instr_getq    <= mem_rdata_q[6:0] == 7'b0001011 && mem_rdata_q[31:25] == 7'b0000000 && ENABLE_IRQ && ENABLE_IRQ_QREGS;
@@ -1133,7 +1156,7 @@ module picorv32 #(
 			endcase
 		end
 
-		if (!resetn) begin
+		if (!resetn || (HALT_DEBUG&&halted)) begin
 			is_beq_bne_blt_bge_bltu_bgeu <= 0;
 			is_compare <= 0;
 
@@ -1166,7 +1189,9 @@ module picorv32 #(
 		end
 	end
 
-
+	//halt_debug 
+	reg step_active,resuem_hold;
+	reg step_wait,resume_wait;
 	// Main State Machine
 
 	localparam cpu_state_trap   = 8'b10000000;
@@ -1211,6 +1236,8 @@ module picorv32 #(
 
 	reg [31:0] current_pc;
 	assign next_pc = latched_store && latched_branch ? reg_out & ~1 : reg_next_pc;
+
+	assign output_pc = reg_pc;
 
 	reg [3:0] pcpi_timeout_counter;
 	reg pcpi_timeout;
@@ -1330,6 +1357,14 @@ module picorv32 #(
 					cpuregs_write = 1;
 				end
 			endcase
+		end
+		if(HALT_DEBUG)begin
+			if(halt_debug_mode && halted)begin
+				cpuregs_wrdata = reg_wr_data;
+				if(reg_wr) begin
+					cpuregs_write = reg_valid ;
+				end
+			end
 		end
 	end
 
@@ -1455,6 +1490,15 @@ module picorv32 #(
 			trace_data <= 'bx;
 
 		if (!resetn) begin
+			if(HALT_DEBUG) begin
+				halted <= 0;
+				steped <= 0;
+				step_active <= 0;
+				step_wait <= 0;
+				reg_xfer_ready <= 0;
+				resuem_hold	<=	0;
+				resume_wait <= 0;
+			end
 			reg_pc <= PROGADDR_RESET;
 			reg_next_pc <= PROGADDR_RESET;
 			if (ENABLE_COUNTERS)
@@ -1486,6 +1530,43 @@ module picorv32 #(
 		case (cpu_state)
 			cpu_state_trap: begin
 				trap <= 1;
+				mem_do_prefetch <= 0;
+				if(HALT_DEBUG) begin
+					mem_do_rinst <= 0;
+					steped <= !steped&step;
+					halted <= 'b1;
+					reg_rdata <= cpuregs_rs1;
+					latched_rd <= reg_addr;
+					reg_next_pc <= reg_pc;
+					step_wait <= 0;
+					reg_xfer_ready <= (!reg_xfer_ready) && (reg_valid);
+					resuem_hold	<=	0;
+					resume_wait <= 0;
+					if(step&&(!steped)) begin
+						step_active <= 1;
+						halted <= 0;
+						cpu_state <= cpu_state_fetch;
+						mem_do_prefetch <= 1;
+					end
+					else if(resume) begin
+						halted <= 0;
+						cpu_state <= cpu_state_fetch;
+						mem_do_prefetch <= 1;
+						resuem_hold	<=	1;
+						resume_wait <= 1;
+					end
+					if(wr_pc )begin
+						current_pc = write_pc;
+						reg_next_pc <= current_pc;
+						reg_pc <= write_pc;
+					end
+					else if(reg_valid && (!reg_xfer_ready)) begin
+						
+						if(reg_wr) begin
+							
+						end
+					end
+				end
 			end
 
 			cpu_state_fetch: begin
@@ -1564,6 +1645,12 @@ module picorv32 #(
 						count_instr <= count_instr + 1;
 						if (!ENABLE_COUNTERS64) count_instr[63:32] <= 0;
 					end
+					if(HALT_DEBUG && halt_debug_mode && !step_wait && step_active)begin
+						step_active <= 0;
+						step_wait <= step_active;
+						halted <= 0;
+					end
+					
 					if (instr_jal) begin
 						mem_do_rinst <= 1;
 						reg_next_pc <= current_pc + decoded_imm_j;
@@ -1572,6 +1659,25 @@ module picorv32 #(
 						mem_do_rinst <= 0;
 						mem_do_prefetch <= !instr_jalr && !instr_retirq;
 						cpu_state <= cpu_state_ld_rs1;
+					end
+					if(HALT_DEBUG && halt_debug_mode )begin
+						resuem_hold <= 0;
+						if(step_wait && (!step_active) )begin
+							step_wait <= 0;
+							cpu_state <= cpu_state_trap;
+							halted <= 1;
+							reg_next_pc <= reg_next_pc;
+						end
+					end
+				end
+
+				if(HALT_DEBUG&halt_debug_mode)begin
+					resume_wait <= resuem_hold;
+					if(((!(resuem_hold|resume_wait)) && halt && (!step_wait) && (!step_active) )  || (step_wait && (!step_active) ))begin
+						step_wait <= 0;
+						cpu_state <= cpu_state_trap;
+						halted <= 1;
+						reg_next_pc <= reg_next_pc; 
 					end
 				end
 			end
@@ -1602,25 +1708,37 @@ module picorv32 #(
 									latched_store <= pcpi_int_wr;
 									cpu_state <= cpu_state_fetch;
 								end else
-								if (CATCH_ILLINSN && (pcpi_timeout || instr_ecall_ebreak)) begin
-									pcpi_valid <= 0;
-									`debug($display("EBREAK OR UNSUPPORTED INSN AT 0x%08x", reg_pc);)
-									if (ENABLE_IRQ && !irq_mask[irq_ebreak] && !irq_active) begin
-										next_irq_pending[irq_ebreak] = 1;
-										cpu_state <= cpu_state_fetch;
-									end else
-										cpu_state <= cpu_state_trap;
+								if(instr_ebreak && HALT_DEBUG && halt_debug_mode) begin
+									halted <= 1;
+									cpu_state <= cpu_state_trap;
+								end
+								else begin
+									if (CATCH_ILLINSN && (pcpi_timeout || instr_ecall_ebreak)) begin
+										pcpi_valid <= 0;
+										`debug($display("EBREAK OR UNSUPPORTED INSN AT 0x%08x", reg_pc);)
+										if (ENABLE_IRQ && !irq_mask[irq_ebreak] && !irq_active) begin
+											next_irq_pending[irq_ebreak] = 1;
+											cpu_state <= cpu_state_fetch;
+										end else
+											cpu_state <= cpu_state_trap;
+									end
 								end
 							end else begin
 								cpu_state <= cpu_state_ld_rs2;
 							end
 						end else begin
 							`debug($display("EBREAK OR UNSUPPORTED INSN AT 0x%08x", reg_pc);)
-							if (ENABLE_IRQ && !irq_mask[irq_ebreak] && !irq_active) begin
-								next_irq_pending[irq_ebreak] = 1;
-								cpu_state <= cpu_state_fetch;
-							end else
+							if(instr_ebreak && HALT_DEBUG && halt_debug_mode) begin
+								halted <= 1;
 								cpu_state <= cpu_state_trap;
+							end
+							else begin
+								if (ENABLE_IRQ && !irq_mask[irq_ebreak] && !irq_active) begin
+									next_irq_pending[irq_ebreak] = 1;
+									cpu_state <= cpu_state_fetch;
+								end else
+									cpu_state <= cpu_state_trap;
+							end
 						end
 					end
 					ENABLE_COUNTERS && is_rdcycle_rdcycleh_rdinstr_rdinstrh: begin
@@ -1637,6 +1755,10 @@ module picorv32 #(
 						endcase
 						latched_store <= 1;
 						cpu_state <= cpu_state_fetch;
+					end
+					((!CATCH_ILLINSN) && HALT_DEBUG && (!WITH_PCPI) ) && (instr_ebreak && halt_debug_mode): begin
+						halted <= 1;
+						cpu_state <= cpu_state_trap;
 					end
 					is_lui_auipc_jal: begin
 						reg_op1 <= instr_lui ? 0 : reg_pc;
@@ -1774,15 +1896,25 @@ module picorv32 #(
 							latched_store <= pcpi_int_wr;
 							cpu_state <= cpu_state_fetch;
 						end else
-						if (CATCH_ILLINSN && (pcpi_timeout || instr_ecall_ebreak)) begin
-							pcpi_valid <= 0;
-							`debug($display("EBREAK OR UNSUPPORTED INSN AT 0x%08x", reg_pc);)
-							if (ENABLE_IRQ && !irq_mask[irq_ebreak] && !irq_active) begin
-								next_irq_pending[irq_ebreak] = 1;
-								cpu_state <= cpu_state_fetch;
-							end else
-								cpu_state <= cpu_state_trap;
+						if(instr_ebreak && HALT_DEBUG && halt_debug_mode) begin
+							halted <= 1;
+							cpu_state <= cpu_state_trap;
 						end
+						else begin
+							if (CATCH_ILLINSN && (pcpi_timeout || instr_ecall_ebreak)) begin
+								pcpi_valid <= 0;
+								`debug($display("EBREAK OR UNSUPPORTED INSN AT 0x%08x", reg_pc);)
+								if (ENABLE_IRQ && !irq_mask[irq_ebreak] && !irq_active) begin
+									next_irq_pending[irq_ebreak] = 1;
+									cpu_state <= cpu_state_fetch;
+								end else
+									cpu_state <= cpu_state_trap;
+							end
+						end
+					end
+					(instr_ebreak && HALT_DEBUG && halt_debug_mode && (!WITH_PCPI) ): begin
+						halted <= 1;
+						cpu_state <= cpu_state_trap;
 					end
 					is_sb_sh_sw: begin
 						cpu_state <= cpu_state_stmem;
@@ -2539,7 +2671,8 @@ module picorv32_axi #(
 	parameter [31:0] LATCHED_IRQ = 32'h ffff_ffff,
 	parameter [31:0] PROGADDR_RESET = 32'h 0000_0000,
 	parameter [31:0] PROGADDR_IRQ = 32'h 0000_0010,
-	parameter [31:0] STACKADDR = 32'h ffff_ffff
+	parameter [31:0] STACKADDR = 32'h ffff_ffff,
+	parameter [ 0:0] HALT_DEBUG = 1
 ) (
 	input clk, resetn,
 	output trap,
@@ -2567,6 +2700,23 @@ module picorv32_axi #(
 	input         mem_axi_rvalid,
 	output        mem_axi_rready,
 	input  [31:0] mem_axi_rdata,
+
+	//debug interface
+	input halt_debug_mode,
+	input halt,
+	output halted,
+	input step,
+	output steped,
+	input	resume,
+	output [31:0] output_pc,
+	input	[31:0] write_pc,
+	input	wr_pc,
+	input 	[5:0] reg_addr,
+	input	reg_wr,
+	input	[31:0] reg_wr_data,
+	output [31:0] reg_rdata,
+	input	reg_valid,
+	output reg_xfer_ready,
 
 	// Pico Co-Processor Interface (PCPI)
 	output        pcpi_valid,
@@ -2670,7 +2820,8 @@ module picorv32_axi #(
 		.LATCHED_IRQ         (LATCHED_IRQ         ),
 		.PROGADDR_RESET      (PROGADDR_RESET      ),
 		.PROGADDR_IRQ        (PROGADDR_IRQ        ),
-		.STACKADDR           (STACKADDR           )
+		.STACKADDR           (STACKADDR           ),
+		.HALT_DEBUG			 (HALT_DEBUG		  )
 	) picorv32_core (
 		.clk      (clk   ),
 		.resetn   (resetn),
@@ -2683,6 +2834,22 @@ module picorv32_axi #(
 		.mem_instr(mem_instr),
 		.mem_ready(mem_ready),
 		.mem_rdata(mem_rdata),
+
+		.halt_debug_mode(halt_debug_mode),
+		.halt(halt),
+		.halted(halted),
+		.step(step),
+		.steped(steped),
+		.resume(resume),
+		.output_pc(output_pc),
+		.write_pc(write_pc),
+		.wr_pc(wr_pc),
+		.reg_addr(reg_addr),
+		.reg_wr(reg_wr),
+		.reg_wr_data(reg_wr_data),
+		.reg_rdata(reg_rdata),
+		.reg_valid(reg_valid),
+		.reg_xfer_ready(reg_xfer_ready),
 
 		.pcpi_valid(pcpi_valid),
 		.pcpi_insn (pcpi_insn ),
@@ -2837,7 +3004,8 @@ module picorv32_wb #(
 	parameter [31:0] LATCHED_IRQ = 32'h ffff_ffff,
 	parameter [31:0] PROGADDR_RESET = 32'h 0000_0000,
 	parameter [31:0] PROGADDR_IRQ = 32'h 0000_0010,
-	parameter [31:0] STACKADDR = 32'h ffff_ffff
+	parameter [31:0] STACKADDR = 32'h ffff_ffff,
+	parameter [ 0:0] HALT_DEBUG = 1
 ) (
 	output trap,
 
@@ -2853,6 +3021,23 @@ module picorv32_wb #(
 	output reg wbm_stb_o,
 	input wbm_ack_i,
 	output reg wbm_cyc_o,
+
+	//debug interface
+	input halt_debug_mode,
+	input halt,
+	output halted,
+	input step,
+	output steped,
+	input	resume,
+	output [31:0] output_pc,
+	input	[31:0] write_pc,
+	input	wr_pc,
+	input 	[5:0] reg_addr,
+	input	reg_wr,
+	input	[31:0] reg_wr_data,
+	output [31:0] reg_rdata,
+	input	reg_valid,
+	output reg_xfer_ready,
 
 	// Pico Co-Processor Interface (PCPI)
 	output        pcpi_valid,
@@ -2934,7 +3119,8 @@ module picorv32_wb #(
 		.LATCHED_IRQ         (LATCHED_IRQ         ),
 		.PROGADDR_RESET      (PROGADDR_RESET      ),
 		.PROGADDR_IRQ        (PROGADDR_IRQ        ),
-		.STACKADDR           (STACKADDR           )
+		.STACKADDR           (STACKADDR           ),
+		.HALT_DEBUG			 (HALT_DEBUG		  )
 	) picorv32_core (
 		.clk      (clk   ),
 		.resetn   (resetn),
@@ -2947,6 +3133,22 @@ module picorv32_wb #(
 		.mem_instr(mem_instr),
 		.mem_ready(mem_ready),
 		.mem_rdata(mem_rdata),
+
+		.halt_debug_mode(halt_debug_mode),
+		.halt(halt),
+		.halted(halted),
+		.step(step),
+		.steped(steped),
+		.resume(resume),
+		.output_pc(output_pc),
+		.write_pc(write_pc),
+		.wr_pc(wr_pc),
+		.reg_addr(reg_addr),
+		.reg_wr(reg_wr),
+		.reg_wr_data(reg_wr_data),
+		.reg_rdata(reg_rdata),
+		.reg_valid(reg_valid),
+		.reg_xfer_ready(reg_xfer_ready),
 
 		.pcpi_valid(pcpi_valid),
 		.pcpi_insn (pcpi_insn ),
