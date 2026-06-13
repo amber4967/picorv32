@@ -1539,6 +1539,7 @@ module picorv32 #(
 					latched_rd <= reg_addr;
 					reg_next_pc <= reg_pc;
 					step_wait <= 0;
+					step_active <= 0;
 					reg_xfer_ready <= (!reg_xfer_ready) && (reg_valid);
 					resuem_hold	<=	0;
 					resume_wait <= 0;
