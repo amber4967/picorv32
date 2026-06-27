@@ -1543,6 +1543,7 @@ module picorv32 #(
 					reg_xfer_ready <= (!reg_xfer_ready) && (reg_valid);
 					resuem_hold	<=	0;
 					resume_wait <= 0;
+					do_waitirq <= 0;
 					if(step&&(!steped)) begin
 						step_active <= 1;
 						halted <= 0;
@@ -1674,6 +1675,7 @@ module picorv32 #(
 
 				if(HALT_DEBUG&halt_debug_mode)begin
 					resume_wait <= resuem_hold;
+					if (resume_wait) resuem_hold <= 1'b0; 
 					if(((!(resuem_hold|resume_wait)) && halt && (!step_wait) && (!step_active) )  || (step_wait && (!step_active) ))begin
 						step_wait <= 0;
 						cpu_state <= cpu_state_trap;
